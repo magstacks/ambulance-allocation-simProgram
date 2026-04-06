@@ -5,7 +5,6 @@ import re
 import pandas as pd
 import numpy as np
 
-# 功能函數
 try:
     from sim_functions import (
         initialize_fleet_state,
@@ -15,16 +14,11 @@ try:
     )
 except ImportError as e:
     raise ImportError(
-        "找不到 sim_functions.py\n"
-        "請確認主程式和 sim_functions.py 放在同一個資料夾。"
+        "找不到 sim_functions.py。請確認主程式和 sim_functions.py 放在同一個資料夾。"
     ) from e
 
 
 # A. 路徑與參數設定
-# 告訴程式要讀哪幾個檔案
-# 控制這次是跑小樣本還是全量
-# 控制要不要只看有效案件、只看到場案件、只看單一分隊救護
-
 BASE_DIR = Path(__file__).resolve().parent
 
 CASE_FILE = BASE_DIR / "案件_252505_不含精確地址.xlsx"
@@ -36,24 +30,21 @@ OUTPUT_DIR = BASE_DIR / "simulation_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # 模擬模式
-RUN_SMALL_SAMPLE = True       # True: 先跑小樣本驗證；False: 跑全資料
-ONLY_VALID_CASES = True       # 只保留有效案件
-ONLY_ARRIVED_SCENE = True     # 只保留有到案件地點的案件
-ONLY_SINGLE_DISPATCH = True   # 先只跑「單一分隊救護」
+RUN_SMALL_SAMPLE = True     # True: 先跑小樣本驗證；False: 跑全資料
+ONLY_VALID_CASES = False      # v3：納入取消案件，所以預設 False
+ONLY_ARRIVED_SCENE = False    # v3：納入未到場案件，所以預設 False
+ONLY_SINGLE_DISPATCH = True   # 先仍只跑「單一分隊救護」
 LIMIT_CASES = None            # 可填 50 / 100；None 代表不另外限制筆數
 
 # 小樣本時間窗
 SAMPLE_START = "2022-01-01 08:00:00"
-SAMPLE_END   = "2022-01-01 10:00:00"
+SAMPLE_END   = "2022-01-01 22:00:00"
 
 EXPECTED_TOTAL_UNITS = 51
 
 
-# B. 小工具（這些可放主程式）
+# B. 小工具
 def standardize_station_name(raw_name: str) -> str:
-    """
-    把不同檔案中的分隊名稱統一
-    """
     if pd.isna(raw_name):
         return np.nan
 
@@ -78,16 +69,13 @@ def standardize_station_name(raw_name: str) -> str:
 
 
 def _combine_date_and_time(date_norm: pd.Series, time_series: pd.Series) -> pd.Series:
-    """
-    date(YYYY-mm-dd 00:00:00) + HH:MM:SS -> datetime
-    """
     td = pd.to_timedelta(time_series.astype(str).where(time_series.notna(), None))
     return date_norm + td
 
 
 def build_event_datetimes(df: pd.DataFrame) -> pd.DataFrame:
     """
-    依照救護流程順序合併完整 datetime，並自動處理跨日。
+    依流程順序合併完整 datetime，並自動處理跨日。
     流程順序：受理 -> 派遣 -> 出勤 -> 到達 -> 離開 -> 到院 -> 離院 -> 返隊
     """
     date_norm = pd.to_datetime(df["案發時間"]).dt.normalize()
@@ -127,16 +115,6 @@ def build_event_datetimes(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_travel_lookup_from_matrix(travel_matrix_df: pd.DataFrame) -> dict:
-    """
-
-    原始格式：
-    第一欄 = 分隊
-    後面每一欄 = 某個 grid_id
-    儲存格數值 = travel minutes
-
-    把 Google Maps 的矩陣表轉成字典
-    讓後面可以快速查：(station_name, grid_id) -> travel_minutes
-    """
     travel_matrix_df = travel_matrix_df.copy()
     travel_matrix_df = travel_matrix_df.rename(columns={travel_matrix_df.columns[0]: "station_name"})
     travel_matrix_df["station_name"] = travel_matrix_df["station_name"].apply(standardize_station_name)
@@ -186,11 +164,9 @@ def load_case_data():
 
     df = pd.read_excel(CASE_FILE, sheet_name="case_information_complete252505", usecols=usecols)
 
-    # 合併完整 datetime（含跨日處理
     event_dt = build_event_datetimes(df)
     df = pd.concat([df, event_dt], axis=1)
 
-    # 改英文 / 主程式用欄位名
     df = df.rename(columns={
         "案號": "case_id",
         "案件地點網格編號": "grid_id",
@@ -205,7 +181,7 @@ def load_case_data():
 
     df["historical_station"] = df["historical_station"].apply(standardize_station_name)
 
-    # 過濾(?)
+    # 過濾
     if ONLY_VALID_CASES:
         df = df[df["case_status"] == "有效案件"].copy()
 
@@ -215,30 +191,61 @@ def load_case_data():
     if ONLY_SINGLE_DISPATCH:
         df = df[df["dispatch_mode"] == "單一分隊救護"].copy()
 
+    # grid_id 還是 simulation 必要欄位
     df = df[df["grid_id"].notna()].copy()
     df["grid_id"] = df["grid_id"].astype(int)
 
-    # --- 歷史指標（用來比較模擬結果是否合理） ---
+    # 依時間欄位判斷任務情境
+    df["has_scene_arrival"] = df["arrive_dt"].notna()
+    df["has_hospital_arrival"] = df["arrive_hosp_dt"].notna()
+
+    df["task_scenario"] = np.where(
+        ~df["has_scene_arrival"],
+        "NO_SCENE",
+        np.where(~df["has_hospital_arrival"], "SCENE_NO_HOSP", "SCENE_TO_HOSP")
+    )
+
+    # 歷史時間指標
+    # 只有有到場案件才有反應時間意義
     df["historical_response_min"] = (df["arrive_dt"] - df["accepted_dt"]).dt.total_seconds() / 60.0
-    df["historical_busy_after_arrival_min"] = (df["return_dt"] - df["arrive_dt"]).dt.total_seconds() / 60.0
-    df["historical_busy_after_depart_min"] = (df["return_dt"] - df["depart_dt"]).dt.total_seconds() / 60.0
 
-    # 模擬中的 service time：優先用到達現場後到返隊；若 arrive 缺值再退而求其次
-    df["service_minutes_for_sim"] = df["historical_busy_after_arrival_min"]
-    mask_missing = df["service_minutes_for_sim"].isna()
-    df.loc[mask_missing, "service_minutes_for_sim"] = df.loc[mask_missing, "historical_busy_after_depart_min"]
+    # 各種 busy time 候選值
+    df["busy_dispatch_to_return_min"] = (df["return_dt"] - df["dispatch_dt"]).dt.total_seconds() / 60.0
+    df["busy_depart_to_return_min"] = (df["return_dt"] - df["depart_dt"]).dt.total_seconds() / 60.0
+    df["busy_arrive_to_return_min"] = (df["return_dt"] - df["arrive_dt"]).dt.total_seconds() / 60.0
 
-    # 保留合理數值
+    # v3 模擬要用的 service/busy time
+    df["service_minutes_for_sim"] = np.nan
+
+    # 情境 1：未到場
+    mask_no_scene = df["task_scenario"] == "NO_SCENE"
+    df.loc[mask_no_scene, "service_minutes_for_sim"] = df.loc[mask_no_scene, "busy_dispatch_to_return_min"]
+    mask_no_scene_missing = mask_no_scene & df["service_minutes_for_sim"].isna()
+    df.loc[mask_no_scene_missing, "service_minutes_for_sim"] = df.loc[mask_no_scene_missing, "busy_depart_to_return_min"]
+
+    # 情境 2/3：有到場
+    mask_arrived = ~mask_no_scene
+    df.loc[mask_arrived, "service_minutes_for_sim"] = df.loc[mask_arrived, "busy_arrive_to_return_min"]
+    mask_arrived_missing = mask_arrived & df["service_minutes_for_sim"].isna()
+    df.loc[mask_arrived_missing, "service_minutes_for_sim"] = df.loc[mask_arrived_missing, "busy_depart_to_return_min"]
+
+    # 保留可模擬資料
     df = df[df["accepted_dt"].notna()].copy()
     df = df[df["service_minutes_for_sim"].notna()].copy()
-    df = df[df["historical_response_min"].notna()].copy()
-    df = df[df["historical_response_min"] >= 0].copy()
     df = df[df["service_minutes_for_sim"] >= 0].copy()
 
-    # 排序
+    # 有到場的案件才要求 historical_response_min 合理
+    mask_bad_arrived_response = (
+        df["has_scene_arrival"]
+        & (
+            df["historical_response_min"].isna()
+            | (df["historical_response_min"] < 0)
+        )
+    )
+    df = df[~mask_bad_arrived_response].copy()
+
     df = df.sort_values("accepted_dt").reset_index(drop=True)
 
-    # 小樣本時間窗
     if RUN_SMALL_SAMPLE:
         start_dt = pd.Timestamp(SAMPLE_START)
         end_dt = pd.Timestamp(SAMPLE_END)
@@ -246,15 +253,12 @@ def load_case_data():
 
     if LIMIT_CASES is not None:
         df = df.head(LIMIT_CASES).copy()
-
+    
     return df
 
 
 
 def load_fleet_config():
-    """
-    直接讀各分隊原始救護車配置.xlsx
-    """
     if not FLEET_CONFIG_FILE.exists():
         raise FileNotFoundError(f"找不到 {FLEET_CONFIG_FILE.name}")
 
@@ -281,9 +285,6 @@ def load_fleet_config():
 
 
 def load_travel_time_matrix():
-    """
-    直接讀 GoogleMapsAPI_凌晨三點行車時間.xlsx 的「分隊到網格中心」工作表
-    """
     if not TRAVEL_TIME_FILE.exists():
         raise FileNotFoundError(f"找不到 {TRAVEL_TIME_FILE.name}")
 
@@ -293,33 +294,33 @@ def load_travel_time_matrix():
 
     return travel_matrix_df
 
-
 # D. 主模擬流程
 def run_simulation(case_df, fleet_state, travel_lookup):
-    """
-    主程式 while 迴圈：一筆案件一筆案件讀進來，更新車況、選車、派車、記錄結果
-    """
     results = []
 
     i = 0
     while i < len(case_df):
         case_row = case_df.iloc[i]
         current_time = case_row["accepted_dt"]
+        scenario = case_row["task_scenario"]
 
         # 1) 先更新哪些車已經恢復 Available
         fleet_state = release_finished_units(fleet_state, current_time)
 
-        # 2) 根據「最近且有空的車」規則選車
+        # 2) 先沿用「最近且有空的車」選車規則
         dispatch_result = select_nearest_available(
             case_row=case_row,
             fleet_state=fleet_state,
             travel_lookup=travel_lookup,
         )
 
-        # 3) if / else：有派到 or 沒派到
         if dispatch_result is None:
             results.append({
                 "case_id": case_row["case_id"],
+                "case_status": case_row["case_status"],
+                "dispatch_mode": case_row["dispatch_mode"],
+                "handling_type": case_row["handling_type"],
+                "task_scenario": scenario,
                 "accepted_dt": case_row["accepted_dt"],
                 "grid_id": case_row["grid_id"],
                 "assigned_ambulance": None,
@@ -336,33 +337,48 @@ def run_simulation(case_df, fleet_state, travel_lookup):
             i += 1
             continue
 
-        # 4) 模擬任務結束時間：沿用歷史資料中的 service time
-        mission_end_dt = dispatch_result["arrival_dt_sim"] + pd.Timedelta(
-            minutes=float(case_row["service_minutes_for_sim"])
-        )
+        # 情境分流：
+        # A. 未到場案件：不計 arrival / response，用歷史 dispatch->return 類型 busy time
+        if scenario == "NO_SCENE":
+            mission_end_dt = dispatch_result["dispatch_dt_sim"] + pd.Timedelta(
+                minutes=float(case_row["service_minutes_for_sim"])
+            )
+            arrival_dt_out = pd.NaT
+            response_min_out = np.nan
+            status_out = "OK_NO_SCENE"
+        # B. 有到場案件：維持原本做法
+        else:
+            mission_end_dt = dispatch_result["arrival_dt_sim"] + pd.Timedelta(
+                minutes=float(case_row["service_minutes_for_sim"])
+            )
+            arrival_dt_out = dispatch_result["arrival_dt_sim"]
+            response_min_out = dispatch_result["response_min_sim"]
+            status_out = "OK_ARRIVED"
 
-        # 5) 將該車標記成忙碌
         fleet_state = mark_unit_busy(
             fleet_state=fleet_state,
             ambulance_id=dispatch_result["ambulance_id"],
             mission_end_time=mission_end_dt,
         )
 
-        # 6) 紀錄結果
         results.append({
             "case_id": case_row["case_id"],
+            "case_status": case_row["case_status"],
+            "dispatch_mode": case_row["dispatch_mode"],
+            "handling_type": case_row["handling_type"],
+            "task_scenario": scenario,
             "accepted_dt": case_row["accepted_dt"],
             "grid_id": case_row["grid_id"],
             "assigned_ambulance": dispatch_result["ambulance_id"],
             "assigned_station": dispatch_result["station_name"],
             "dispatch_dt_sim": dispatch_result["dispatch_dt_sim"],
-            "arrival_dt_sim": dispatch_result["arrival_dt_sim"],
+            "arrival_dt_sim": arrival_dt_out,
             "travel_min_sim": dispatch_result["travel_min_sim"],
             "wait_min_sim": dispatch_result["wait_min_sim"],
-            "response_min_sim": dispatch_result["response_min_sim"],
+            "response_min_sim": response_min_out,
             "mission_end_dt_sim": mission_end_dt,
             "historical_response_min": case_row["historical_response_min"],
-            "status": "OK",
+            "status": status_out,
         })
 
         i += 1
@@ -372,31 +388,22 @@ def run_simulation(case_df, fleet_state, travel_lookup):
 
 
 # E. 輸出與摘要
-
 def summarize_result(result_df: pd.DataFrame):
-    ok_df = result_df[result_df["status"] == "OK"].copy()
+    ok_df = result_df[result_df["status"].isin(["OK_ARRIVED", "OK_NO_SCENE"])].copy()
+    arrived_ok_df = ok_df[ok_df["response_min_sim"].notna()].copy()
 
-    if len(ok_df) == 0:
-        return pd.DataFrame([{
-            "n_total": len(result_df),
-            "n_ok": 0,
-            "sim_mean_response": np.nan,
-            "sim_median_response": np.nan,
-            "sim_p90_response": np.nan,
-            "hist_mean_response": np.nan,
-            "hist_median_response": np.nan,
-        }])
-
-    summary = pd.DataFrame([{
+    return pd.DataFrame([{
         "n_total": len(result_df),
         "n_ok": len(ok_df),
-        "sim_mean_response": ok_df["response_min_sim"].mean(),
-        "sim_median_response": ok_df["response_min_sim"].median(),
-        "sim_p90_response": ok_df["response_min_sim"].quantile(0.90),
-        "hist_mean_response": ok_df["historical_response_min"].mean(),
-        "hist_median_response": ok_df["historical_response_min"].median(),
+        "n_ok_arrived": len(arrived_ok_df),
+        "n_ok_no_scene": int((ok_df["task_scenario"] == "NO_SCENE").sum()) if len(ok_df) > 0 else 0,
+        "n_cancel_cases": int((result_df["case_status"] == "取消案件").sum()) if len(result_df) > 0 else 0,
+        "sim_mean_response": arrived_ok_df["response_min_sim"].mean() if len(arrived_ok_df) > 0 else np.nan,
+        "sim_median_response": arrived_ok_df["response_min_sim"].median() if len(arrived_ok_df) > 0 else np.nan,
+        "sim_p90_response": arrived_ok_df["response_min_sim"].quantile(0.90) if len(arrived_ok_df) > 0 else np.nan,
+        "hist_mean_response": arrived_ok_df["historical_response_min"].mean() if len(arrived_ok_df) > 0 else np.nan,
+        "hist_median_response": arrived_ok_df["historical_response_min"].median() if len(arrived_ok_df) > 0 else np.nan,
     }])
-    return summary
 
 
 
@@ -423,6 +430,10 @@ def main():
     print(f"Number of stations (geo file): {station_geo['station_name'].nunique()}")
     print(f"Number of grids (geo file): {grid_geo['grid_id'].nunique()}")
     print(f"Total fleet size in fleet_config: {fleet_config_df['vehicle_count'].sum()}")
+    print("Cases by scenario before simulation:")
+    print(case_df["task_scenario"].value_counts(dropna=False).to_string())
+    print("Cases by valid/cancel before simulation:")
+    print(case_df["case_status"].value_counts(dropna=False).to_string())
 
     print("=== Building lookup tables / initializing fleet state ===")
     travel_lookup = build_travel_lookup_from_matrix(travel_matrix_df)
