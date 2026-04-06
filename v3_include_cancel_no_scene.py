@@ -1,4 +1,19 @@
 # -*- coding: utf-8 -*-
+"""
+主程式版：救護車派遣 Simulation Driver（v3：納入取消案件＋未到場案件）
+-----------------------------------------------------------------------
+這版目標：
+1. 納入「取消案件」
+2. 納入「未到案件地點」案件
+3. 仍然先只跑「單一分隊救護」
+4. 雙軌 / ALS 規則暫時不處理
+
+這版的重要想法：
+- 有到場案件：維持原本做法，用 Google 去程時間 + 歷史到場後忙碌時間
+- 未到場案件：仍會派一台車，但不計算 response time；車輛忙碌時間改用歷史的
+  dispatch->return（若缺則退而求其次用 depart->return）
+- 取消案件：先不另外做特殊派遣規則，只要時間欄位足以估 busy time，就照歷史時間資料建模
+"""
 
 from pathlib import Path
 import re
@@ -18,7 +33,9 @@ except ImportError as e:
     ) from e
 
 
+# =========================================================
 # A. 路徑與參數設定
+# =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 
 CASE_FILE = BASE_DIR / "案件_252505_不含精確地址.xlsx"
@@ -30,7 +47,7 @@ OUTPUT_DIR = BASE_DIR / "simulation_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # 模擬模式
-RUN_SMALL_SAMPLE = True     # True: 先跑小樣本驗證；False: 跑全資料
+RUN_SMALL_SAMPLE = False     # True: 先跑小樣本驗證；False: 跑全資料
 ONLY_VALID_CASES = False      # v3：納入取消案件，所以預設 False
 ONLY_ARRIVED_SCENE = False    # v3：納入未到場案件，所以預設 False
 ONLY_SINGLE_DISPATCH = True   # 先仍只跑「單一分隊救護」
@@ -43,7 +60,9 @@ SAMPLE_END   = "2022-01-01 22:00:00"
 EXPECTED_TOTAL_UNITS = 51
 
 
+# =========================================================
 # B. 小工具
+# =========================================================
 def standardize_station_name(raw_name: str) -> str:
     if pd.isna(raw_name):
         return np.nan
@@ -133,7 +152,9 @@ def build_travel_lookup_from_matrix(travel_matrix_df: pd.DataFrame) -> dict:
     return lookup
 
 
+# =========================================================
 # C. 讀取與前處理資料
+# =========================================================
 def load_geo_data():
     station_geo = pd.read_excel(GEO_FILE, sheet_name="分隊")
     grid_geo = pd.read_excel(GEO_FILE, sheet_name="網格（900）")
@@ -155,6 +176,15 @@ def load_geo_data():
 
 
 def load_case_data():
+    """
+    這版前處理重點：
+    1. 不再預設排除取消案件 / 未到場案件
+    2. 依任務情境分類成：
+       - NO_SCENE         : 有出勤但沒有到現場
+       - SCENE_NO_HOSP    : 有到現場但沒有到醫院
+       - SCENE_TO_HOSP    : 有送醫完整流程
+    3. 不同情境使用不同 busy time 規則
+    """
     usecols = [
         "案號", "案件地點網格編號", "案發時間", "有效/取消案件", "出車方式",
         "分隊", "車牌號碼", "高級救護隊", "處理情況", "醫院",
@@ -294,7 +324,10 @@ def load_travel_time_matrix():
 
     return travel_matrix_df
 
+
+# =========================================================
 # D. 主模擬流程
+# =========================================================
 def run_simulation(case_df, fleet_state, travel_lookup):
     results = []
 
@@ -387,7 +420,9 @@ def run_simulation(case_df, fleet_state, travel_lookup):
     return result_df, fleet_state
 
 
+# =========================================================
 # E. 輸出與摘要
+# =========================================================
 def summarize_result(result_df: pd.DataFrame):
     ok_df = result_df[result_df["status"].isin(["OK_ARRIVED", "OK_NO_SCENE"])].copy()
     arrived_ok_df = ok_df[ok_df["response_min_sim"].notna()].copy()
@@ -418,7 +453,9 @@ def save_outputs(result_df, summary_df):
     print(f"Summary results saved to: {summary_path}")
 
 
+# =========================================================
 # F. main
+# =========================================================
 def main():
     print("=== Loading data ===")
     station_geo, grid_geo, hospital_geo = load_geo_data()
