@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import pandas as pd
 import numpy as np
+import time
 
 try:
     from sim_functions import (
@@ -52,10 +53,11 @@ ONLY_VALID_CASES = False      # v3：納入取消案件，所以預設 False
 ONLY_ARRIVED_SCENE = False    # v3：納入未到場案件，所以預設 False
 ONLY_SINGLE_DISPATCH = True   # 先仍只跑「單一分隊救護」
 LIMIT_CASES = None            # 可填 50 / 100；None 代表不另外限制筆數
+PROGRESS_EVERY = 1000
 
 # 小樣本時間窗
 SAMPLE_START = "2022-01-01 08:00:00"
-SAMPLE_END   = "2022-01-01 22:00:00"
+SAMPLE_END   = "2022-03-01 22:00:00"
 
 EXPECTED_TOTAL_UNITS = 51
 
@@ -123,10 +125,28 @@ def build_event_datetimes(df: pd.DataFrame) -> pd.DataFrame:
     out["accepted_dt"] = accepted_dt
     last_dt = accepted_dt.copy()
 
+    out = pd.DataFrame(index=df.index)
+    out["accepted_dt"] = accepted_dt
+    last_dt = accepted_dt.copy()
+
+    small_back_tol = pd.Timedelta(minutes=2)   # 小誤差容忍，例如 2 分鐘內
+    rollover_tol = pd.Timedelta(hours=6)       # 倒退超過 6 小時，才視為跨日
+
     for name, dt in sequence[1:]:
-        mask_rollover = dt.notna() & last_dt.notna() & (dt < last_dt)
         dt = dt.copy()
+
+        valid_mask = dt.notna() & last_dt.notna()
+        backward_diff = last_dt - dt   # 若 dt 比 last_dt 小，這個值會是正的
+
+        # 1) 小幅倒退：當成秒數被截掉，直接補成 last_dt
+        mask_small_back = valid_mask & (dt < last_dt) & (backward_diff <= small_back_tol)
+        dt.loc[mask_small_back] = last_dt.loc[mask_small_back]
+
+        # 2) 大幅倒退：視為真的跨日
+        mask_rollover = valid_mask & (dt < last_dt) & (backward_diff > rollover_tol)
         dt.loc[mask_rollover] = dt.loc[mask_rollover] + pd.Timedelta(days=1)
+
+        # 3) 中間倒退幅度：先保留，之後可另外抓出來檢查
         out[name] = dt
         last_dt = dt.where(dt.notna(), last_dt)
 
@@ -197,6 +217,23 @@ def load_case_data():
     event_dt = build_event_datetimes(df)
     df = pd.concat([df, event_dt], axis=1)
 
+    # 以下為v5新增
+    # 受理時間修正版本：若受理時間晚於派遣時間，模擬時改用派遣時間
+    df["accepted_dt_raw"] = df["accepted_dt"]
+    df["accepted_dt_sim"] = df["accepted_dt"]
+    df["accepted_dt_fixed_from_dispatch"] = False
+
+    mask_bad_accepted = (
+        df["accepted_dt"].notna()
+        & df["dispatch_dt"].notna()
+        & (df["accepted_dt"] > df["dispatch_dt"])
+    )
+
+    df.loc[mask_bad_accepted, "accepted_dt_sim"] = df.loc[mask_bad_accepted, "dispatch_dt"]
+    df.loc[mask_bad_accepted, "accepted_dt_fixed_from_dispatch"] = True
+
+    # 以上為v5新增
+
     df = df.rename(columns={
         "案號": "case_id",
         "案件地點網格編號": "grid_id",
@@ -237,7 +274,8 @@ def load_case_data():
 
     # 歷史時間指標
     # 只有有到場案件才有反應時間意義
-    df["historical_response_min"] = (df["arrive_dt"] - df["accepted_dt"]).dt.total_seconds() / 60.0
+    # df["historical_response_min"] = (df["arrive_dt"] - df["accepted_dt"]).dt.total_seconds() / 60.0
+    df["historical_response_min"] = (df["arrive_dt"] - df["accepted_dt_sim"]).dt.total_seconds() / 60.0
 
     # 各種 busy time 候選值
     df["busy_dispatch_to_return_min"] = (df["return_dt"] - df["dispatch_dt"]).dt.total_seconds() / 60.0
@@ -248,12 +286,22 @@ def load_case_data():
     df["service_minutes_for_sim"] = np.nan
 
     # 情境 1：未到場
+    '''
+    service_minutes_for_sim：
+    先算「返隊時間 - 派遣時間」
+    如果這個缺值，再改算「返隊時間 - 出勤時間」
+    '''
     mask_no_scene = df["task_scenario"] == "NO_SCENE"
     df.loc[mask_no_scene, "service_minutes_for_sim"] = df.loc[mask_no_scene, "busy_dispatch_to_return_min"]
     mask_no_scene_missing = mask_no_scene & df["service_minutes_for_sim"].isna()
     df.loc[mask_no_scene_missing, "service_minutes_for_sim"] = df.loc[mask_no_scene_missing, "busy_depart_to_return_min"]
 
     # 情境 2/3：有到場
+    '''
+    service_minutes_for_sim：
+    先算「返隊時間 - 到達時間」
+    如果這個缺值，再改算「返隊時間 - 出勤時間」
+    '''
     mask_arrived = ~mask_no_scene
     df.loc[mask_arrived, "service_minutes_for_sim"] = df.loc[mask_arrived, "busy_arrive_to_return_min"]
     mask_arrived_missing = mask_arrived & df["service_minutes_for_sim"].isna()
@@ -274,12 +322,14 @@ def load_case_data():
     )
     df = df[~mask_bad_arrived_response].copy()
 
-    df = df.sort_values("accepted_dt").reset_index(drop=True)
+    # df = df.sort_values("accepted_dt").reset_index(drop=True)
+    df = df.sort_values("accepted_dt_sim").reset_index(drop=True)
 
     if RUN_SMALL_SAMPLE:
         start_dt = pd.Timestamp(SAMPLE_START)
         end_dt = pd.Timestamp(SAMPLE_END)
-        df = df[(df["accepted_dt"] >= start_dt) & (df["accepted_dt"] < end_dt)].copy()
+        # df = df[(df["accepted_dt"] >= start_dt) & (df["accepted_dt"] < end_dt)].copy()
+        df = df[(df["accepted_dt_sim"] >= start_dt) & (df["accepted_dt_sim"] < end_dt)].copy()
 
     if LIMIT_CASES is not None:
         df = df.head(LIMIT_CASES).copy()
@@ -331,18 +381,37 @@ def load_travel_time_matrix():
 def run_simulation(case_df, fleet_state, travel_lookup):
     results = []
 
+    total_cases = len(case_df)
+    start_clock = time.time()
+
     i = 0
-    while i < len(case_df):
+    while i < total_cases:
         case_row = case_df.iloc[i]
-        current_time = case_row["accepted_dt"]
+        # current_time = case_row["accepted_dt"]
+        current_time = case_row["accepted_dt_sim"]
         scenario = case_row["task_scenario"]
+
+        # 每隔幾筆顯示一次進度
+        if i == 0 or ((i + 1) % PROGRESS_EVERY == 0):
+            elapsed_min = (time.time() - start_clock) / 60
+            print(
+                f"[Progress] {i + 1:,}/{total_cases:,} "
+                f"({(i + 1) / total_cases:.1%}) | "
+                f"elapsed = {elapsed_min:.2f} min | "
+                f"current accepted_dt = {current_time}",
+                flush=True
+            )
 
         # 1) 先更新哪些車已經恢復 Available
         fleet_state = release_finished_units(fleet_state, current_time)
 
-        # 2) 先沿用「最近且有空的車」選車規則
+        # 2) 建立給選車函數用的案件資料（把 accepted_dt 換成 accepted_dt_sim）
+        case_row_for_sim = case_row.copy()
+        case_row_for_sim["accepted_dt"] = case_row["accepted_dt_sim"]
+
+        # 3) 先沿用「最近且有空的車」選車規則
         dispatch_result = select_nearest_available(
-            case_row=case_row,
+            case_row=case_row_for_sim,
             fleet_state=fleet_state,
             travel_lookup=travel_lookup,
         )
@@ -366,6 +435,9 @@ def run_simulation(case_df, fleet_state, travel_lookup):
                 "mission_end_dt_sim": pd.NaT,
                 "historical_response_min": case_row["historical_response_min"],
                 "status": "NO_UNIT_OR_NO_TRAVEL_TIME",
+                "accepted_dt_raw": case_row["accepted_dt_raw"],
+                "accepted_dt_sim": case_row["accepted_dt_sim"],
+                "accepted_dt_fixed_from_dispatch": case_row["accepted_dt_fixed_from_dispatch"],
             })
             i += 1
             continue
@@ -412,12 +484,23 @@ def run_simulation(case_df, fleet_state, travel_lookup):
             "mission_end_dt_sim": mission_end_dt,
             "historical_response_min": case_row["historical_response_min"],
             "status": status_out,
+            "accepted_dt_raw": case_row["accepted_dt_raw"],
+            "accepted_dt_sim": case_row["accepted_dt_sim"],
+            "accepted_dt_fixed_from_dispatch": case_row["accepted_dt_fixed_from_dispatch"],
         })
 
         i += 1
 
+    total_elapsed_min = (time.time() - start_clock) / 60
+    print(
+        f"[Progress] done: {total_cases:,}/{total_cases:,} "
+        f"(100.0%) | elapsed = {total_elapsed_min:.2f} min",
+        flush=True
+    )
+
     result_df = pd.DataFrame(results)
     return result_df, fleet_state
+  
 
 
 # =========================================================
