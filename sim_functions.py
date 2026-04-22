@@ -231,7 +231,7 @@ def _lookup_travel_minutes(station_name, grid_id, travel_lookup: dict):
 
 def select_dual_dispatch_units(case_row, fleet_state: pd.DataFrame, travel_lookup: dict):
     """
-    雙軌案件選車：若當下不可派，則往後搜尋最早可行時間（>=1 ALS 且總車數>=2）。
+    針對雙軌案件，尋找最早滿足「最近 ALS 分隊可供 1 台 ALS，且總共可派 2 台車」的派遣時間並完成選車。
     """
     required_cols = {
         "ambulance_id",
@@ -245,26 +245,49 @@ def select_dual_dispatch_units(case_row, fleet_state: pd.DataFrame, travel_looku
     if missing:
         raise ValueError(f"fleet_state 缺少必要欄位: {sorted(missing)}")
 
+    def _get_case_value(row, key, default=None):
+        if isinstance(row, dict):
+            return row.get(key, default)
+        if hasattr(row, "index") and key in row.index:
+            return row[key]
+        return default
+
+    def _lookup_travel_minutes(station_name, grid_id, lookup: dict):
+        travel_min = lookup.get((station_name, grid_id))
+        if travel_min is None:
+            travel_min = lookup.get((str(station_name), grid_id))
+        if travel_min is None:
+            travel_min = lookup.get((station_name, str(grid_id)))
+        if travel_min is None:
+            travel_min = lookup.get((str(station_name), str(grid_id)))
+
+        if travel_min is None:
+            return None
+
+        try:
+            return float(travel_min)
+        except Exception:
+            return None
+
     accepted_dt = pd.Timestamp(_get_case_value(case_row, "accepted_dt"))
     grid_id = _get_case_value(case_row, "grid_id")
     required_units = int(_get_case_value(case_row, "required_units", 2))
     require_als = int(_get_case_value(case_row, "require_als", 1))
 
     if required_units != 2:
-        raise ValueError("這版 select_dual_dispatch_units() 預設只支援 required_units = 2")
+        raise ValueError("這版 select_dual_dispatch_units() 只支援 required_units = 2")
     if require_als != 1:
-        raise ValueError("這版 select_dual_dispatch_units() 預設只支援 require_als = 1")
+        raise ValueError("這版 select_dual_dispatch_units() 只支援 require_als = 1")
 
     fs = fleet_state.copy()
     fs["available_at"] = pd.to_datetime(fs["available_at"], errors="coerce")
 
     def build_candidate_df(dispatch_time: pd.Timestamp) -> pd.DataFrame:
         """
-        在某個 dispatch_time 下，找出『到該時間點已可用』且 travel time 查得到的車。
-        注意：
-        - 若 status == Available，表示此刻就在 current_station 可派
-        - 若 status == On duty 但 available_at <= dispatch_time，
-          則依第一版假設，視為已回 home_station 可派
+        在 dispatch_time 這一刻，把已可派的車整理成 candidate dataframe。
+        - status == 'Available'：直接可派，位置用 current_station
+        - status == 'On duty' 但 available_at <= dispatch_time：
+          視為已回 home_station，可派
         """
         rows = []
 
@@ -308,92 +331,73 @@ def select_dual_dispatch_units(case_row, fleet_state: pd.DataFrame, travel_looku
         ).reset_index(drop=True)
         return out
 
-    def is_feasible(candidate_df: pd.DataFrame) -> bool:
-        if len(candidate_df) < required_units:
-            return False
-        if candidate_df["is_als"].sum() < require_als:
-            return False
-        return True
+    def pick_units_by_final_rule(candidate_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        依你們最後定案規則選車：
 
-    def pick_units(candidate_df: pd.DataFrame) -> pd.DataFrame:
+        1. 先找最近的 ALS 分隊
+        2. 若該分隊有 2 台 ALS 可用 -> 派 2 台 ALS（限同一分隊）
+        3. 若該分隊只有 1 台 ALS 可用 -> 派 1 台 ALS + 全體最近 1 台 BLS
+        4. 若找不到符合這個規則的組合 -> 回空 DataFrame
         """
-        按本版規則選出 2 台：
-        - ALS >= 2：選 travel 最短的 2 台 ALS
-        - ALS == 1：選 1 ALS + 1 最近 BLS
-        """
+        if candidate_df.empty:
+            return pd.DataFrame(columns=candidate_df.columns)
+
         als_df = candidate_df[candidate_df["is_als"]].copy()
-        bls_df = candidate_df[~candidate_df["is_als"]].copy()
+        if als_df.empty:
+            return pd.DataFrame(columns=candidate_df.columns)
 
-        if len(als_df) >= 2:
-            selected = als_df.head(2).copy()
+        # 先找「最近的 ALS 分隊」
+        # 因為 candidate_df 已按 travel_min / ambulance_id 排序，所以第一個 ALS 所在分隊就是最近 ALS 分隊
+        nearest_als_row = als_df.iloc[0]
+        nearest_als_station = nearest_als_row["station_name"]
+
+        # 該 ALS 分隊底下所有可用 ALS
+        als_same_station = als_df[als_df["station_name"] == nearest_als_station].copy()
+        als_same_station = als_same_station.sort_values(
+            by=["travel_min_sim", "ambulance_id"],
+            ascending=[True, True]
+        ).reset_index(drop=True)
+
+        # 規則 1：最近 ALS 分隊若能出 2 台 ALS，就派 2 ALS（都來自同一 ALS 分隊）
+        if len(als_same_station) >= 2:
+            selected = als_same_station.head(2).copy()
             return selected.reset_index(drop=True)
 
-        if len(als_df) == 1 and len(bls_df) >= 1:
-            selected = pd.concat(
-                [als_df.head(1), bls_df.head(1)],
-                ignore_index=True
-            )
-            selected = selected.sort_values(
+        # 規則 2：最近 ALS 分隊只有 1 台 ALS -> 補全體最近 BLS 1 台
+        if len(als_same_station) == 1:
+            chosen_als = als_same_station.head(1).copy()
+
+            bls_df = candidate_df[~candidate_df["is_als"]].copy()
+            bls_df = bls_df.sort_values(
                 by=["travel_min_sim", "ambulance_id"],
                 ascending=[True, True]
             ).reset_index(drop=True)
-            return selected
+
+            if len(bls_df) >= 1:
+                chosen_bls = bls_df.head(1).copy()
+                selected = pd.concat([chosen_als, chosen_bls], ignore_index=True)
+                selected = selected.sort_values(
+                    by=["travel_min_sim", "ambulance_id"],
+                    ascending=[True, True]
+                ).reset_index(drop=True)
+                return selected
+
+            # 沒有 BLS，就不符合你們最後定案規則
+            return pd.DataFrame(columns=candidate_df.columns)
 
         return pd.DataFrame(columns=candidate_df.columns)
 
-    # 1) 先看 accepted_dt 當下能不能派
+    # 先檢查 accepted_dt 當下
     candidate_now = build_candidate_df(accepted_dt)
-    if is_feasible(candidate_now):
+    selected_now = pick_units_by_final_rule(candidate_now)
+
+    if len(selected_now) == required_units:
         dispatch_dt = accepted_dt
-        selected_df = pick_units(candidate_now)
-        if len(selected_df) == required_units:
-            wait_min = 0.0
-            selected_units = []
-
-            for _, row in selected_df.iterrows():
-                arrival_dt = dispatch_dt + pd.to_timedelta(row["travel_min_sim"], unit="m")
-                selected_units.append(
-                    {
-                        "ambulance_id": row["ambulance_id"],
-                        "station_name": row["station_name"],
-                        "is_als": bool(row["is_als"]),
-                        "dispatch_dt_sim": dispatch_dt,
-                        "arrival_dt_sim": arrival_dt,
-                        "travel_min_sim": float(row["travel_min_sim"]),
-                        "wait_min_sim": wait_min,
-                        "response_min_sim": wait_min + float(row["travel_min_sim"]),
-                    }
-                )
-
-            return {
-                "dispatch_dt_sim": dispatch_dt,
-                "selected_units": selected_units,
-            }
-
-    # 2) 當下不可派，往後找最早可行時間
-    future_times = (
-        fs["available_at"]
-        .dropna()
-        .loc[lambda s: s > accepted_dt]
-        .sort_values()
-        .unique()
-    )
-
-    for future_time in future_times:
-        dispatch_dt = pd.Timestamp(future_time)
-        candidate_future = build_candidate_df(dispatch_dt)
-
-        if not is_feasible(candidate_future):
-            continue
-
-        selected_df = pick_units(candidate_future)
-        if len(selected_df) != required_units:
-            continue
-
-        wait_min = (dispatch_dt - accepted_dt).total_seconds() / 60.0
+        wait_min = 0.0
         selected_units = []
 
-        for _, row in selected_df.iterrows():
+        for _, row in selected_now.iterrows():
             arrival_dt = dispatch_dt + pd.to_timedelta(row["travel_min_sim"], unit="m")
             selected_units.append(
                 {
@@ -413,7 +417,47 @@ def select_dual_dispatch_units(case_row, fleet_state: pd.DataFrame, travel_looku
             "selected_units": selected_units,
         }
 
-    # 3) 理論上通常不會到這裡；若 fleet 根本無法滿足條件，就回 None
+    # 當下不行，就往後找最早可行時間點
+    future_times = (
+        fs["available_at"]
+        .dropna()
+        .loc[lambda s: s > accepted_dt]
+        .sort_values()
+        .unique()
+    )
+
+    for future_time in future_times:
+        dispatch_dt = pd.Timestamp(future_time)
+        candidate_future = build_candidate_df(dispatch_dt)
+        selected_future = pick_units_by_final_rule(candidate_future)
+
+        if len(selected_future) != required_units:
+            continue
+
+        wait_min = (dispatch_dt - accepted_dt).total_seconds() / 60.0
+        selected_units = []
+
+        for _, row in selected_future.iterrows():
+            arrival_dt = dispatch_dt + pd.to_timedelta(row["travel_min_sim"], unit="m")
+            selected_units.append(
+                {
+                    "ambulance_id": row["ambulance_id"],
+                    "station_name": row["station_name"],
+                    "is_als": bool(row["is_als"]),
+                    "dispatch_dt_sim": dispatch_dt,
+                    "arrival_dt_sim": arrival_dt,
+                    "travel_min_sim": float(row["travel_min_sim"]),
+                    "wait_min_sim": wait_min,
+                    "response_min_sim": wait_min + float(row["travel_min_sim"]),
+                }
+            )
+
+        return {
+            "dispatch_dt_sim": dispatch_dt,
+            "selected_units": selected_units,
+        }
+
+    # 若整個 fleet_state 都找不到符合最終規則的時點，才回 None
     return None
 
 
